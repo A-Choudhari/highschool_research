@@ -9,7 +9,8 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 from typing import List, Tuple, Dict
 import random
-
+from sympy import mod_inverse
+import concurrent.futures
 
 # ====== Metric Tracking ======
 class MetricsTracker:
@@ -301,75 +302,80 @@ class HomomorphicEncryption:
         return average
 
 
-# ====== AMEDP Implementation ======
-class AdaptiveModularEncryption:
-    def __init__(self):
-        # self.encryption_key = np.random.randint(1e6, 1e7)  # Adaptive key based on task sensitivity
-        self.public_key, self.private_key = paillier.generate_paillier_keypair()
-    def encrypt(self, value: float) -> float:
-        """
-        Lightweight encryption using modular arithmetic.
-        """
-        return self.public_key.encrypt(float(value))
-
-    def decrypt(self, value: float) -> float:
-        """
-        Decrypt using the encryption key.
-        """
-        return self.private_key.decrypt(value)
-
-
-class DifferentialPartitioning:
-    def __init__(self, num_parties: int = 3):
+class ScalableAverageCalculator:
+    def __init__(self, num_parties: int = 1000, num_clusters: int = 10, prime: int = 2147):
         self.num_parties = num_parties
+        self.num_clusters = num_clusters
+        self.prime = prime
+        self.threshold = 3  # Threshold for Shamir's Secret Sharing
+        self.public_key, self.private_key = paillier.generate_paillier_keypair()
 
-    def partition_data(self, data: np.ndarray) -> List[np.ndarray]:
-        """
-        Partition the dataset based on trust levels or computational capacity.
-        """
-        partition_size = len(data) // self.num_parties
-        partitions = [data[i * partition_size:(i + 1) * partition_size] for i in range(self.num_parties)]
-        # Handle any leftover data
-        if len(data) % self.num_parties != 0:
-            partitions[-1] = np.concatenate((partitions[-1], data[self.num_parties * partition_size:]))
-        return partitions
+    def _generate_coefficients(self, secret: int) -> list:
+        return [secret] + [np.random.randint(1, self.prime) for _ in range(self.threshold - 1)]
 
+    def _share_secret(self, secret: int) -> list:
+        coefficients = self._generate_coefficients(secret)
+        return [(i, self._evaluate_polynomial(i, coefficients)) for i in range(1, self.num_parties + 1)]
 
-class AMEDP:
-    def __init__(self, num_parties: int = 3):
-        self.encryption = AdaptiveModularEncryption()
-        self.partitioning = DifferentialPartitioning(num_parties=num_parties)
+    def _evaluate_polynomial(self, x: int, coefficients: list) -> int:
+        result = 0
+        for power, coeff in enumerate(coefficients):
+            term = (coeff * pow(x, power, self.prime)) % self.prime  # Modular exponentiation to avoid large powers
+            result = (result + term) % self.prime
+        return result
+
+    def _reconstruct_secret(self, shares: list) -> int:
+        secret = 0
+        for i, (xi, yi) in enumerate(shares):
+            numerator, denominator = 1, 1
+            for j, (xj, _) in enumerate(shares):
+                if i != j:
+                    numerator = (numerator * -xj) % self.prime
+                    denominator = (denominator * (xi - xj)) % self.prime
+            lagrange_coefficient = (numerator * pow(denominator, -1, self.prime)) % self.prime
+            secret = (secret + yi * lagrange_coefficient) % self.prime
+        return secret
+
+    def _divide_into_clusters(self, data: list) -> list:
+        cluster_size = self.num_parties // self.num_clusters
+        return [data[i * cluster_size:(i + 1) * cluster_size] for i in range(self.num_clusters)]
 
     def compute_average(self, data: np.ndarray) -> float:
-        """
-        Compute the average using the AMEDP strategy.
-        """
         start_time = time.time()
 
-        # Partition data among parties
-        partitions = self.partitioning.partition_data(data)
-        print(f"Data partitioned into {len(partitions)} parts.")
+        # Ensure data is a 1D array of integers
+        if not np.issubdtype(data.dtype, np.integer):
+            data = data.astype(int)
 
-        # Encrypt and compute sum for each partition
-        encrypted_sums = [self.encryption.encrypt(np.sum(partition)) for partition in partitions]
-        print("Encrypted and computed sums for each partition.")
+        # Step 1: Generate Shamir shares in parallel
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            shares = list(executor.map(self._share_secret, data.flatten()))
+        print("Generated Shamir shares for all parties.")
 
-        # Decrypt each partition sum and compute the total sum
-        decrypted_sums = [self.encryption.decrypt(x) for x in encrypted_sums]
-        total_sum = sum(decrypted_sums)
+        # Step 2: Divide shares into clusters
+        clusters = self._divide_into_clusters(shares)
+        print(f"Data divided into {len(clusters)} clusters.")
 
-        # Compute the average
+        # Step 3: Aggregate within clusters in parallel
+        def process_cluster(cluster):
+            cluster_sum = sum(self._reconstruct_secret(share[:self.threshold]) for share in cluster)
+            # Convert cluster_sum to a Python int
+            return self.public_key.encrypt(int(cluster_sum))
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            cluster_aggregates = list(executor.map(process_cluster, clusters))
+
+        print("Computed encrypted sums for each cluster.")
+
+        # Step 4: Decrypt and aggregate cluster results
+        total_sum = sum(self.private_key.decrypt(value) for value in cluster_aggregates)
         average = total_sum / len(data)
 
         end_time = time.time()
-        # Metrics tracking
-        metrics_tracker.track(
-            latency=(end_time - start_time),
-            communication=len(partitions) * 8,  # Assuming 8 bytes per encrypted sum
-            accuracy=1.0
-        )
+        print(f"Latency: {end_time - start_time:.4f} seconds")
+        print(f"Communication: {len(clusters) * self.threshold * 8} bytes (approximate)")
 
         return average / 10.0
+
 
 # ====== Main Execution ======
 def generate_dataset(rows: int, cols: int) -> np.ndarray:
@@ -396,16 +402,10 @@ if __name__ == "__main__":
     ss_avg = secret_sharing_average(dataset)
     print("Secret Sharing average:", ss_avg)
 
-    # print("\nRunning GPU Computation...")
-    # gpu = GPUComputation()
-    # gpu_avg = gpu.compute_average(dataset)
-    # print("GPU average:", gpu_avg)
-
-
     print("\nRunning Hybrid Model...")
-    hybrid = AMEDP()
-    hybrid_avg = hybrid.compute_average(dataset)
-    print("Hybrid Model average:", hybrid_avg)
+    calculator = ScalableAverageCalculator(num_parties=1000, num_clusters=10)
+    average = calculator.compute_average(dataset)
+    print("Hybrid Model average:", average)
 
     print("\nRunning Homomorphic Encryption...")
     he = HomomorphicEncryption()
